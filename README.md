@@ -1,6 +1,10 @@
-# Quantum Image Transformation Lab — supplied 12-image dataset
+# Quantum Image Transformation Lab
 
-The existing notebook layout, inline FRQI implementation, original upload/Compare controls, MNIST study, folder-access fix, and Section 12A recovery comparison are preserved. The photo dataset is now exactly the 12 images supplied in this chat. The previous sunset, stock-photo collection, and simulated exposure variants are excluded.
+This project explores quantum image transformations using Flexible Representation of Quantum Images (FRQI). It compares classical and quantum brightness increases of **10%, 25%, and 50%**, image negatives, and reconstruction accuracy.
+
+The experiments use **12 real-world photographs**, including cave interiors, night scenes, and images with challenging lighting. FRQI is verified using synthetic 4×4 images, followed by tests on 20 MNIST images at 4×4 and 8×8 resolutions. An interactive upload interface supports testing additional photographs.
+
+Reconstruction and recovery quality are evaluated using **MAE, PSNR, and SSIM**. Quantum operations run through Qiskit’s classical statevector simulation; the project does not claim a practical quantum speedup or guaranteed image-quality improvement.
 
 ## Run
 

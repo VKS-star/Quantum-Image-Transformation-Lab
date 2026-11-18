@@ -1,0 +1,1100 @@
+= Quantum Image Transformation Lab
+
+== FRQI brightness control for low-light photo enhancement
+
+This single-notebook project studies whether FRQI quantum operations can
+brighten genuinely underexposed photographs and how closely their
+reconstructed images match normal-light references.
+
+=== Practical use case
+
+The primary application is *low-light photo enhancement*: a dim indoor
+or night-time image is brightened to improve visibility. The primary
+dataset is LOL (LOw-Light), which provides paired low-light inputs and
+normal-light reference images captured from real scenes. This pairing
+lets us measure whether each brightness operation moves the input toward
+the desired exposure, rather than only comparing two transformations of
+an unrelated image.
+
+=== Study sequence
+
+[arabic]
+. Verify FRQI using known synthetic 4×4 images.
+. Use the official LOL evaluation pairs as the main use-case benchmark.
+. Compare classical and quantum brightness increases of 10%, 25%, and
+50%, plus image negatives.
+. Evaluate against both the matching classical output and the paired
+normal-light reference.
+. Keep balanced MNIST as a controlled handwritten-image benchmark, not
+the main application dataset.
+. Study resolution, finite-shot readout, and an interactive upload
+interface.
+
+Run cells top to bottom. Install dependencies once if needed:
+
+[source,text]
+----
+pip install qiskit qiskit-aer numpy pandas matplotlib pillow scikit-image scikit-learn ipywidgets gdown
+----
+
+The LOL official page provides a small test archive. The notebook tries
+to download it through Google Drive; if that does not work, download
+*Test.zip* from the https://daooshee.github.io/BMVC2018website/[official
+LOL project page] and place it at
+`~/.cache/quantum-image-lab/LOL-Test.zip`. The loader also accepts an
+extracted `LOLdataset/eval15/low` and `LOLdataset/eval15/high` folder.
+The dataset contains paired low/normal-light images and was introduced
+for low-light enhancement research. (Original project:
+https://daooshee.github.io/BMVC2018website/[Deep Retinex Decomposition
+for Low-Light Enhancement].)
+
+*Scope:* Qiskit uses classical statevector simulation here. FRQI
+represents grayscale, so paired color photos are converted to grayscale
+before encoding. This study does not claim a practical end-to-end
+quantum speedup.
+
+== 1. Imports and reproducibility
+
+The imports are centralized so the notebook can be run from a fresh
+kernel. A fixed random seed is used only for repeatable finite-shot
+sampling; exact statevector calculations are deterministic.
+
+
+
+
+**Focused revision:** original 16-section sequence, inline FRQI implementation, and upload interface retained. The photographic benchmark, galleries, shot example, and reconstruction comparison now use all 12 newly supplied real-scene files from `data/photos/`. The prior sunset and assorted stock subjects are excluded. The manifest flags brighter or softer-focus sources without excluding them. MNIST remains solely the separately requested digit study. Brightness increases are +10%, +25%, +50%; no brightness decrease is added. The original negative and global-Ry educational comparisons remain.
+
+[source,ipython3]
+----
+# Numerical and table tools support image calculations and compact experiment summaries.
+import io, os, time, urllib.request, warnings, zipfile, json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image, ImageOps
+from IPython.display import display
+from skimage.metrics import structural_similarity as ssim
+from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.library import UCRYGate
+from qiskit.quantum_info import Statevector, state_fidelity
+
+
+RNG = np.random.default_rng(2026)
+HALF_PI = np.pi / 2
+PROJECT_DIR = os.environ.get("QIL_PROJECT_DIR", "")
+
+def locate_project_folder():
+    if PROJECT_DIR:
+        candidate = Path(PROJECT_DIR).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("PROJECT_DIR must be an absolute path to the extracted project folder.")
+        candidates = [candidate]
+    else:
+        candidates = []
+        try:
+            candidates.append(Path.cwd())
+        except OSError:
+            pass
+        home_folder = Path.home()
+        candidates.extend([
+            home_folder / "Quantum_Image_Transformation_Lab",
+            home_folder / "Downloads" / "Quantum_Image_Transformation_Lab",
+            *[home_folder / "Downloads" / f"Quantum_Image_Transformation_Lab {index}" for index in range(2, 11)],
+        ])
+    for candidate in candidates:
+        try:
+            if (candidate / "data/mnist.npz").is_file() and (candidate / "data/dataset_manifest.json").is_file():
+                with (candidate / "data/dataset_manifest.json").open() as manifest_file:
+                    dataset_info = json.load(manifest_file)
+                if dataset_info.get("dataset_id") != "user_supplied_2026_11_18_12_images":
+                    continue
+                with (candidate / "data" / dataset_info["images"][0]["path"]).open("rb") as photo_file:
+                    photo_file.read(1)
+                with (candidate / "data/mnist.npz").open("rb") as mnist_file:
+                    mnist_file.read(1)
+                return candidate
+        except (OSError, ValueError, KeyError, IndexError):
+            continue
+    raise PermissionError(
+        "The extracted project folder cannot be accessed. Set PROJECT_DIR in this cell "
+        "to its absolute folder path. If macOS blocks Downloads/Documents, move the entire "
+        "extracted folder to ~/Quantum_Image_Transformation_Lab using Finder, restart the "
+        "Jupyter kernel, and rerun. Keep the notebook and data folder together. "
+        "This code does not change macOS permissions."
+    )
+
+PROJECT_ROOT = locate_project_folder()
+CACHE = PROJECT_ROOT / "data"
+print("Project folder:", PROJECT_ROOT)
+print("Environment ready. Dataset cache:", CACHE)
+
+----
+
+== 2. FRQI encoding and reconstruction
+
+For a square image with side length `S = 2^n`, FRQI uses `2n` position
+qubits and one colour qubit. Each pixel intensity `I_i` becomes an
+angle `theta_i = (pi/2) * I_i/255`. The encoded state is
+
+`|I> = 1/sqrt(S*S) * sum_i (cos(theta_i)|0> + sin(theta_i)|1>) tensor |i>`.
+
+Hadamard gates create an equal superposition of pixel addresses. A
+uniformly controlled `Ry(2 theta_i)` rotates the colour qubit by an
+amount selected by each address. Readout estimates intensity from
+`P(colour=1 | address=i) = sin(theta_i)^2`.
+
+[source,ipython3]
+----
+# FRQI accepts square power-of-two grayscale arrays, with pixel addresses flattened row first.
+def validate_image(image):
+    """Check the assumptions required by the FRQI encoding used in this notebook."""
+    a = np.asarray(image, dtype=float)
+    if a.ndim != 2 or a.shape[0] != a.shape[1]:
+        raise ValueError("FRQI input must be a square, single-channel image.")
+    side = a.shape[0]
+    if side < 2 or side & (side - 1):
+        raise ValueError("Image side length must be a power of two (2, 4, 8, 16, ...).")
+    if not np.isfinite(a).all() or a.min() < 0 or a.max() > 255:
+        raise ValueError("Pixel values must be finite and within [0, 255].")
+    return a
+
+def image_to_angles(image):
+    """Map 8-bit grayscale values to FRQI angles in [0, pi/2]."""
+    image = validate_image(image)
+    return (image.ravel() / 255.0) * HALF_PI
+
+def angles_to_image(angles, side):
+    """Convert decoded FRQI angles back to grayscale levels and restore image shape."""
+    return np.clip(np.asarray(angles), 0, HALF_PI).reshape(side, side) * (255.0 / HALF_PI)
+
+def position_qubits(side):
+    """Return 2*log2(side), the number of qubits needed to address all pixels."""
+    return 2 * int(np.log2(side))
+
+def frqi_circuit(image):
+    """Prepare |I>: Hadamards address pixels, then one uniformly controlled Ry encodes colour."""
+    image = validate_image(image)
+    side = image.shape[0]
+    angles = image_to_angles(image)
+    address_count = position_qubits(side)
+    circuit = QuantumCircuit(address_count + 1, name=f"FRQI_{side}x{side}")
+    colour = address_count
+    circuit.h(range(address_count))
+    circuit.append(UCRYGate([2 * float(theta) for theta in angles]), [colour] + list(range(address_count)))
+    return circuit
+
+def negative_gate(side):
+    """An X on the colour qubit exchanges theta and pi/2-theta: intensity becomes 255-I."""
+    circuit = QuantumCircuit(position_qubits(side) + 1)
+    circuit.x(position_qubits(side))
+    return circuit
+
+def global_brightness_gate(side, increase):
+    """A single global Ry adds the same angle offset to every pixel (additive brightness)."""
+    circuit = QuantumCircuit(position_qubits(side) + 1)
+    circuit.ry(increase * np.pi, position_qubits(side))
+    return circuit
+
+def controlled_multiplicative_gate(image, increase):
+    """Apply per-pixel angle deltas to implement clipped I*(1+increase) brightness."""
+    image = validate_image(image)
+    side = image.shape[0]
+    angles = image_to_angles(image)
+    deltas = np.minimum(angles * increase, HALF_PI - angles)
+    circuit = QuantumCircuit(position_qubits(side) + 1)
+    circuit.append(UCRYGate([2 * float(delta) for delta in deltas]), [position_qubits(side)] + list(range(position_qubits(side))))
+    return circuit
+
+print("FRQI encoder and transformation circuits defined.")
+
+----
+
+== 3. Classical baselines, readout, and accuracy measures
+
+Two brightness definitions are compared fairly with their matching
+classical operations: (a) multiplicative `I*(1+p)` with
+clipping, and (b) additive `I+255p` with clipping. The global
+quantum rotation follows the additive angle rule and can wrap when an
+angle exceeds `pi/2`; it does not perform clipping.
+
+Exact reconstruction uses the statevector and isolates the
+transformation. Shot reconstruction samples a finite number of complete
+outcomes; at least some pixels may receive fewer observations. MAE and
+PSNR measure pixel error, SSIM measures structural similarity, and state
+fidelity measures the transformed quantum state against the ideal
+encoded target.
+
+[source,ipython3]
+----
+# Classical target transformations; clipping is the ordinary 8-bit image convention.
+def classical_multiplicative(image, increase):
+    return np.clip(np.asarray(image, float) * (1 + increase), 0, 255)
+
+def classical_additive(image, increase):
+    return np.clip(np.asarray(image, float) + 255 * increase, 0, 255)
+
+def classical_negative(image):
+    return 255 - np.asarray(image, float)
+
+def decode_exact(state, side):
+    """Recover each pixel from exact amplitudes (the colour bit is the most-significant bit)."""
+    amplitudes = np.asarray(state.data).reshape(2, side * side)
+    conditional_one = np.clip(np.abs(amplitudes[1]) ** 2 * (side * side), 0, 1)
+    return angles_to_image(np.arcsin(np.sqrt(conditional_one)), side)
+
+def decode_by_shots(state, side, shots, seed=0):
+    """Sample the ideal measurement distribution and reconstruct from finite counts."""
+    probabilities = np.abs(np.asarray(state.data)) ** 2
+    counts = np.random.default_rng(seed).multinomial(shots, probabilities / probabilities.sum()).reshape(2, side * side)
+    total = counts.sum(axis=0)
+    conditional_one = np.divide(counts[1], total, out=np.zeros(side * side, dtype=float), where=total > 0)
+    return angles_to_image(np.arcsin(np.sqrt(np.clip(conditional_one, 0, 1))), side)
+
+def image_metrics(reference, estimate):
+    """Return common full-reference image metrics for two same-sized grayscale arrays."""
+    reference, estimate = np.asarray(reference, float), np.asarray(estimate, float)
+    mse = float(np.mean((reference - estimate) ** 2))
+    side = reference.shape[0]
+    window = min(7, side if side % 2 else side - 1)
+    return {"MAE": float(np.mean(np.abs(reference - estimate))),
+            "PSNR_dB": 99.0 if mse < 1e-12 else float(10 * np.log10(255**2 / mse)),
+            "SSIM": float(ssim(reference, estimate, data_range=255, win_size=window))}
+
+def ideal_frqi_state(image):
+    """Build the ideal FRQI state analytically, for state-fidelity comparisons."""
+    theta = image_to_angles(image)
+    return Statevector(np.concatenate([np.cos(theta), np.sin(theta)]) / np.sqrt(theta.size))
+
+print("Baselines, reconstruction methods, and image metrics defined.")
+
+----
+
+== 4. First prove the encoding: synthetic 4×4 verification
+
+Before running a dataset experiment, use three known images: a smooth
+gradient, a checkerboard, and a centered square. Check state
+normalization, agreement with the expected FRQI amplitudes, exact pixel
+recovery, and the negative operation. This is a verification gate:
+unexpected errors should be fixed before interpreting later results.
+
+[source,ipython3]
+----
+# Construct synthetic test patterns with known pixels and inspect the FRQI invariants.
+synthetic_images = {
+    "horizontal gradient": np.tile(np.linspace(0, 220, 4), (4, 1)),
+    "checkerboard": (np.indices((4, 4)).sum(axis=0) % 2) * 220.0,
+    "center square": np.pad(np.full((2, 2), 180.0), 1),
+}
+verification_rows = []
+for name, image in synthetic_images.items():
+    theta = image_to_angles(image)
+    state = Statevector(frqi_circuit(image))
+    expected_amplitudes = np.vstack([np.cos(theta), np.sin(theta)]) / 4.0
+    actual_amplitudes = state.data.reshape(2, 16)
+    recovered = decode_exact(state, 4)
+    negative_state = state.evolve(negative_gate(4))
+    verification_rows.append({
+        "pattern": name,
+        "state_norm": np.linalg.norm(state.data),
+        "largest_amplitude_error": np.max(np.abs(actual_amplitudes - expected_amplitudes)),
+        "decode_MAE": np.mean(np.abs(recovered - image)),
+        "negative_max_error": np.max(np.abs(decode_exact(negative_state, 4) - classical_negative(image))),
+    })
+verification = pd.DataFrame(verification_rows)
+display(verification.round(12))
+assert np.allclose(verification["state_norm"], 1.0, atol=1e-10), "FRQI state must be normalized."
+assert verification["largest_amplitude_error"].max() < 1e-10, "Encoded amplitudes do not match the FRQI equation."
+assert verification["decode_MAE"].max() < 1e-8, "Exact decoder failed to recover the synthetic image."
+assert verification["negative_max_error"].max() < 1e-4, "Quantum negative does not match 255-image within numerical precision."
+print("PASS: synthetic 4x4 FRQI encoding and negative checks.")
+
+----
+
+== 5. Upload an image now: interactive brightness lab
+
+This is the front end for the project and appears before the dataset
+studies. Upload a photo, select a power-of-two FRQI grid and brightness
+increase, and click *Compare*. The input is shown alongside classical
+multiplicative brightness, controlled quantum brightness, global quantum
+brightness, and both negatives. Input brightness and reconstruction
+errors are reported below the image.
+
+Images are converted to grayscale and center-cropped before
+downsampling. The color preview is retained to show the source
+photograph; FRQI operates on the grayscale preview. Exact simulation is
+selected for clear transformation comparison. A later section quantifies
+finite-shot readout error.
+
+[source,ipython3]
+----
+# ipywidgets supplies a notebook-native web interface while keeping the entire project in this file.
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+def prepare_grayscale(source, side):
+    """Convert an uploaded image to luminance, center-crop, and area-resize to side x side."""
+    if isinstance(source, Image.Image):
+        pil = source
+    else:
+        pil = Image.open(io.BytesIO(source))
+    grayscale = pil.convert("L")
+    width, height = grayscale.size
+    edge = min(width, height)
+    grayscale = grayscale.crop(((width-edge)//2, (height-edge)//2, (width-edge)//2+edge, (height-edge)//2+edge))
+    return np.asarray(grayscale.resize((side, side), Image.Resampling.BOX), dtype=float)
+
+image_upload = widgets.FileUpload(accept="image/*", multiple=False, description="Choose image")
+size_picker = widgets.Dropdown(options=[4, 8, 16, 32], value=8, description="FRQI grid:")
+percent_picker = widgets.Dropdown(options=[("10%", .10), ("25%", .25), ("50%", .50)], value=.25, description="Increase:")
+compare_button = widgets.Button(description="Compare", button_style="primary", icon="image")
+comparison_output = widgets.Output()
+
+def get_uploaded_file(upload_widget):
+    """Normalize the different FileUpload value formats used by ipywidgets versions."""
+    value = upload_widget.value
+    if not value:
+        return None, None
+    if isinstance(value, dict):
+        item = next(iter(value.values()))
+        return item.get("name", "uploaded image"), item["content"]
+    item = value[0]
+    return item.get("name", "uploaded image"), item["content"]
+
+def render_upload_comparison(_):
+    """Run the selected FRQI operations and draw a labeled comparison of all outputs."""
+    with comparison_output:
+        clear_output(wait=True)
+        filename, raw = get_uploaded_file(image_upload)
+        if raw is None:
+            print("Choose an image before clicking Compare.")
+            return
+        side, increase = int(size_picker.value), float(percent_picker.value)
+        source = Image.open(io.BytesIO(raw))
+        grayscale = prepare_grayscale(source, side)
+        theta = image_to_angles(grayscale)
+        initial_state = Statevector(frqi_circuit(grayscale))
+        classical_bright = classical_multiplicative(grayscale, increase)
+        quantum_bright = decode_exact(initial_state.evolve(controlled_multiplicative_gate(grayscale, increase)), side)
+        global_bright = decode_exact(initial_state.evolve(global_brightness_gate(side, increase)), side)
+        classical_neg = classical_negative(grayscale)
+        quantum_neg = decode_exact(initial_state.evolve(negative_gate(side)), side)
+        panels = [("Uploaded source", source.convert("RGB")), ("Input, grayscale", grayscale),
+                  ("Classical multiply", classical_bright), ("Quantum controlled multiply", quantum_bright),
+                  ("Quantum global additive", global_bright), ("Classical negative", classical_neg),
+                  ("Quantum negative (X)", quantum_neg)]
+        fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+        for ax, (title, panel) in zip(axes.ravel(), panels):
+            ax.imshow(panel, cmap=None if np.asarray(panel).ndim == 3 else "gray", vmin=None if np.asarray(panel).ndim == 3 else 0, vmax=None if np.asarray(panel).ndim == 3 else 255)
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+        axes.ravel()[-1].axis("off")
+        fig.suptitle(f"{filename} • {side}×{side} grayscale • {position_qubits(side)+1} qubits • +{increase:.0%}")
+        plt.tight_layout()
+        plt.show()
+        for label, reference, estimate in (("Controlled brightness", classical_bright, quantum_bright), ("Negative", classical_neg, quantum_neg)):
+            score = image_metrics(reference, estimate)
+            print(f"{label}: MAE {score['MAE']:.4f} gray levels | PSNR {score['PSNR_dB']:.2f} dB | SSIM {score['SSIM']:.5f}")
+        print(f"Input mean brightness: {grayscale.mean()/255:.1%}; after classical/quantum controlled increase: {classical_bright.mean()/255:.1%} / {quantum_bright.mean()/255:.1%}")
+
+compare_button.on_click(render_upload_comparison)
+display(widgets.VBox([widgets.HTML("<h3>Quantum Image Brightness Lab</h3><p>Upload a real image, choose the experiment settings, then compare.</p>"), image_upload, size_picker, percent_picker, compare_button, comparison_output]))
+
+----
+
+== 6. Data sources: paired low-light photos and MNIST
+
+The main use-case data is the official *LOL test set*: each low-light
+photo has a corresponding normal-light reference. We use the held-out
+evaluation pairs so the target reference is independent of the
+brightness operation. The original project reports a real
+low/normal-light paired dataset; its standard evaluation split contains
+15 image pairs. The download links are on the
+https://daooshee.github.io/BMVC2018website/[original project page].
+
+MNIST remains as a secondary controlled benchmark with 20 balanced
+handwritten digits at 4×4 and 8×8. It helps verify behavior across
+simple shapes, while LOL answers the practical question: does
+brightening a real low-light image make it more similar to its paired
+normal-light image?
+
+The LOL loader accepts the official `Test.zip` or an extracted directory
+with `eval15/low` and `eval15/high` (also supports `Test/low` and
+`Test/normal`).
+
+[source,ipython3]
+----
+# Dataset helpers: MNIST is downloaded automatically; LOL can be fetched through gdown or loaded locally.
+def cached_download(url, filename, attempts=3):
+    """Download a file safely into the local cache, retrying incomplete transfers."""
+    path = CACHE / filename
+    temporary_path = CACHE / (filename + ".part")
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    request = urllib.request.Request(url, headers={"User-Agent": "QuantumImageBrightnessNotebook/1.0"})
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Downloading {filename} (attempt {attempt}/{attempts}).")
+            with urllib.request.urlopen(request, timeout=90) as response:
+                expected = response.headers.get("Content-Length")
+                expected = int(expected) if expected else None
+                received = 0
+                with open(temporary_path, "wb") as target:
+                    while True:
+                        block = response.read(1024 * 1024)
+                        if not block:
+                            break
+                        target.write(block)
+                        received += len(block)
+            if expected is not None and received != expected:
+                raise IOError(f"Incomplete download: {received:,} of {expected:,} bytes.")
+            temporary_path.replace(path)
+            return path
+        except Exception as error:
+            last_error = error
+            temporary_path.unlink(missing_ok=True)
+            if attempt < attempts:
+                time.sleep(attempt)
+    raise IOError(f"Could not download {filename}; check internet access or add the file to {CACHE}.") from last_error
+
+def load_mnist_dataset():
+    """Load the official MNIST test split, with an explicitly named offline fallback."""
+    try:
+        path = cached_download("https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz", "mnist.npz")
+        with np.load(path) as archive:
+            return archive["x_test"], archive["y_test"].astype(int).ravel(), "MNIST official test split"
+    except Exception as error:
+        print("MNIST unavailable:", type(error).__name__, "— using sklearn digits, not MNIST.")
+        from sklearn.datasets import load_digits
+        digits = load_digits()
+        return np.rint(digits.images / 16 * 255).astype(np.uint8), digits.target.astype(int), "sklearn digits fallback (not MNIST)"
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+LOW_DIR_NAMES = {"low", "input", "lowlight", "low_light"}
+REFERENCE_DIR_NAMES = {"high", "normal", "gt", "ground_truth", "normal_light", "well_lit"}
+
+def _image_members_from_zip(archive):
+    """Find matching low/reference image files inside the LOL test archive."""
+    names = [name for name in archive.namelist() if Path(name).suffix.lower() in IMAGE_SUFFIXES]
+    files = set(names)
+    pairs = []
+    for low_name in names:
+        parts = list(Path(low_name).parts)
+        low_positions = [i for i, part in enumerate(parts[:-1]) if part.lower() in LOW_DIR_NAMES]
+        if not low_positions:
+            continue
+        i = low_positions[-1]
+        parent, filename = parts[:i], parts[-1]
+        stem = Path(filename).stem.lower()
+        for reference_folder in REFERENCE_DIR_NAMES:
+            candidate = str(Path(*parent, reference_folder, filename))
+            if candidate in files:
+                pairs.append((low_name, candidate))
+                break
+            # Match a reference image by stem if the archive uses a different extension or case.
+            prefix = str(Path(*parent, reference_folder)).lower().rstrip("/") + "/"
+            matches = [name for name in names if name.lower().startswith(prefix) and Path(name).stem.lower() == stem]
+            if matches:
+                pairs.append((low_name, matches[0]))
+                break
+    return sorted(set(pairs), key=lambda pair: pair[0].lower())
+
+def _read_lol_directory(root):
+    """Read paired images from the usual eval15/low+high or Test/low+normal layout."""
+    pairs = []
+    for low_dir in root.rglob("*"):
+        if not low_dir.is_dir() or low_dir.name.lower() not in LOW_DIR_NAMES:
+            continue
+        sibling_dirs = [path for path in low_dir.parent.iterdir() if path.is_dir() and path.name.lower() in REFERENCE_DIR_NAMES]
+        if not sibling_dirs:
+            continue
+        low_files = sorted(path for path in low_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+        for reference_dir in sibling_dirs:
+            ref_files = sorted(path for path in reference_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+            ref_by_stem = {path.stem.lower(): path for path in ref_files}
+            matched = [(low, ref_by_stem[low.stem.lower()]) for low in low_files if low.stem.lower() in ref_by_stem]
+            if not matched and len(low_files) == len(ref_files):
+                matched = list(zip(low_files, ref_files))
+            for low_path, ref_path in matched:
+                # Keep the held-out evaluation split only.
+                ancestors = {part.lower() for part in low_path.parts}
+                if ancestors.intersection({"eval15", "test", "testing", "eval"}):
+                    low_img = np.asarray(Image.open(low_path).convert("RGB"))
+                    ref_img = np.asarray(Image.open(ref_path).convert("RGB"))
+                    pairs.append((low_img, ref_img, low_path.name))
+    return pairs
+
+def load_lol_test_pairs():
+    """Load LOL's paired test photos from a local extraction or official Test.zip."""
+    local_root = PROJECT_ROOT / "LOLdataset"
+    if local_root.exists():
+        pairs = _read_lol_directory(local_root)
+        if pairs:
+            return pairs, "LOL official extracted evaluation split"
+
+    zip_path = CACHE / "LOL-Test.zip"
+    if not zip_path.exists():
+        return [], "Optional LOL pairs absent; use the bundled real low-light photos in Section 11"
+    if not zip_path.exists() or not zipfile.is_zipfile(zip_path):
+        # Discard stale partial downloads; gdown writes to a temporary path first.
+        zip_path.unlink(missing_ok=True)
+        temporary_zip = CACHE / "LOL-Test.zip.part"
+        temporary_zip.unlink(missing_ok=True)
+        try:
+            import gdown
+            file_id = "1OvHuzPBZRBMDWV5AKI-TtIxPCYY8EW70"  # official project's Test.zip link
+            result = gdown.download(id=file_id, output=str(temporary_zip), quiet=False)
+            if not result or not temporary_zip.exists() or not zipfile.is_zipfile(temporary_zip):
+                raise IOError("Google Drive did not provide a complete ZIP archive.")
+            temporary_zip.replace(zip_path)
+        except Exception as error:
+            temporary_zip.unlink(missing_ok=True)
+            print("Automatic LOL download unavailable:", type(error).__name__)
+            print("Download Test.zip from https://daooshee.github.io/BMVC2018website/ and save it as:", zip_path)
+            return [], "LOL unavailable; manual download required"
+
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            member_pairs = _image_members_from_zip(archive)
+            result = [(np.asarray(Image.open(io.BytesIO(archive.read(low))).convert("RGB")),
+                       np.asarray(Image.open(io.BytesIO(archive.read(reference))).convert("RGB")),
+                       Path(low).name) for low, reference in member_pairs]
+        if not result:
+            print("The LOL archive was opened but low/reference folders were not recognized. Extract it under ./LOLdataset/eval15/low and ./LOLdataset/eval15/high.")
+            return [], "LOL archive layout not recognized"
+        return result, "LOL official paired evaluation images"
+    except Exception as error:
+        print("Could not read LOL archive:", type(error).__name__, error)
+        return [], "LOL archive unavailable"
+
+# Select balanced examples from labeled datasets.
+def balanced_sample(images, labels, per_class, class_count=10):
+    """Return a balanced set containing the first per_class examples of each label."""
+    selected = [int(i) for label in range(class_count) for i in np.flatnonzero(labels == label)[:per_class]]
+    if len(selected) != class_count * per_class:
+        raise ValueError("Not enough examples for a balanced sample.")
+    return [images[i] for i in selected], labels[selected]
+
+def grayscale_image(image):
+    """Convert grayscale or color pixels to 8-bit grayscale for FRQI."""
+    array = np.asarray(image)
+    if array.ndim == 2:
+        return Image.fromarray(array.astype(np.uint8)).convert("L")
+    return Image.fromarray(array.astype(np.uint8)).convert("RGB").convert("L")
+
+def resize_dataset(images, side):
+    """Center-crop and area-resize source images to square grayscale FRQI arrays."""
+    result = []
+    for image in images:
+        gray = grayscale_image(image)
+        width, height = gray.size
+        edge = min(width, height)
+        square = gray.crop(((width-edge)//2, (height-edge)//2, (width-edge)//2+edge, (height-edge)//2+edge))
+        result.append(np.asarray(square.resize((side, side), Image.Resampling.BOX), dtype=float))
+    return result
+
+print("MNIST and paired LOL data helpers are ready.")
+
+----
+
+== 7. Load the use-case dataset and inspect paired examples
+
+The primary benchmark is the LOL held-out test split. Each low-light
+image is paired with a corresponding normal-light reference. If
+automatic Google Drive download is unavailable, the cell explains where
+to place the official `Test.zip`; the experiment can still continue with
+the MNIST benchmark and local photos.
+
+We resize both members of each pair to the same 8×8 and 16×16 grids. The
+pairing makes it possible to ask a practical question: after brightening
+the dark input, does it become more similar to the reference photo?
+
+
+
+The supplied 12-image photo benchmark is always available offline in Section 11. LOL remains optional, with a real paired reference only if its files are present.
+
+[source,ipython3]
+----
+# Load 100 balanced MNIST digits as a controlled benchmark and LOL pairs as the main use-case data.
+mnist_raw, mnist_labels, MNIST_SOURCE = load_mnist_dataset()
+mnist_sample, mnist_y = balanced_sample(mnist_raw, mnist_labels, per_class=2)
+mnist4, mnist8 = resize_dataset(mnist_sample, 4), resize_dataset(mnist_sample, 8)
+print(f"MNIST source: {MNIST_SOURCE}; balanced sample: {len(mnist_sample)}; evaluated at 4x4 and 8x8.")
+
+lol_pairs, LOL_SOURCE = load_lol_test_pairs()
+print(f"LOL source: {LOL_SOURCE}; paired test images loaded: {len(lol_pairs)}.")
+if lol_pairs:
+    lol_low8 = resize_dataset([pair[0] for pair in lol_pairs], 8)
+    lol_ref8 = resize_dataset([pair[1] for pair in lol_pairs], 8)
+    lol_low16 = resize_dataset([pair[0] for pair in lol_pairs], 16)
+    lol_ref16 = resize_dataset([pair[1] for pair in lol_pairs], 16)
+    # Show the same test examples before and after low-resolution preprocessing.
+    count = min(5, len(lol_pairs))
+    fig, axes = plt.subplots(2, count, squeeze=False, figsize=(2.4*count, 5))
+    for j in range(count):
+        axes[0, j].imshow(lol_low16[j], cmap="gray", vmin=0, vmax=255)
+        axes[0, j].set_title(f"Low light {j+1}", fontsize=9)
+        axes[1, j].imshow(lol_ref16[j], cmap="gray", vmin=0, vmax=255)
+        axes[1, j].set_title(f"Normal reference {j+1}", fontsize=9)
+        axes[0, j].axis("off"); axes[1, j].axis("off")
+    fig.suptitle("LOL paired real-scene examples, converted to grayscale 16×16")
+    plt.tight_layout(); plt.show()
+else:
+    lol_low8, lol_ref8, lol_low16, lol_ref16 = [], [], [], []
+    print("To enable the main use-case benchmark, download Test.zip from the official LOL project page and place it at ~/.cache/quantum-image-lab/LOL-Test.zip.")
+
+----
+
+== 8. Benchmark runner: brightness and negative
+
+For each image and each brightness percentage, the circuit is prepared
+from the original image and transformed. Multiplicative quantum
+brightness is compared to `clip(I*(1+p))`; global `Ry`
+brightness is compared to `clip(I+255p)`. We record ideal-state
+fidelity and exact reconstruction error. For one sample per dataset/size
+we also compare finite-shot reconstruction, using a fixed number of
+total outcomes per pixel on average. Negative runs are checked against
+`255-I`.
+
+[source,ipython3]
+----
+# Keep these functions explicit so every metric column has a defined comparison target.
+INCREASES = (0.10, 0.25, 0.50)
+SHOTS_PER_PIXEL = 2048
+
+def evaluate_brightness(images, side, dataset_name, shot_examples=1):
+    """Evaluate both quantum brightness rules against their paired classical transformations."""
+    rows = []
+    for image_index, image in enumerate(images):
+        base = Statevector(frqi_circuit(image))
+        theta = image_to_angles(image)
+        for increase in INCREASES:
+            cases = [
+                ("controlled multiplicative", controlled_multiplicative_gate(image, increase), classical_multiplicative(image, increase)),
+                ("global additive", global_brightness_gate(side, increase), classical_additive(image, increase)),
+            ]
+            for method, gate, target in cases:
+                transformed = base.evolve(gate)
+                exact = decode_exact(transformed, side)
+                score = image_metrics(target, exact)
+                row = {"dataset": dataset_name, "side": side, "image_index": image_index,
+                       "increase": f"+{increase:.0%}", "method": method,
+                       "state_fidelity": state_fidelity(transformed, ideal_frqi_state(target)),
+                       "saturated_fraction": float(np.mean(np.asarray(image) * (1+increase) > 255)), **score}
+                if image_index < shot_examples:
+                    shot = decode_by_shots(transformed, side, SHOTS_PER_PIXEL * side * side, seed=2026 + image_index)
+                    row["shot_MAE"] = image_metrics(target, shot)["MAE"]
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+def evaluate_negative(images, side, dataset_name):
+    """Compare X-gate reconstruction against the exact classical image negative."""
+    rows = []
+    for image_index, image in enumerate(images):
+        source = Statevector(frqi_circuit(image))
+        transformed = source.evolve(negative_gate(side))
+        target = classical_negative(image)
+        rows.append({"dataset": dataset_name, "side": side, "image_index": image_index,
+                     "state_fidelity": state_fidelity(transformed, ideal_frqi_state(target)),
+                     **image_metrics(target, decode_exact(transformed, side))})
+    return pd.DataFrame(rows)
+
+def dataset_summary(results):
+    """Aggregate errors by data source, grid size, transformation, and requested increase."""
+    keys = [key for key in ("dataset", "side", "method", "increase") if key in results.columns]
+    return results.groupby(keys).mean(numeric_only=True).round(4)
+
+print("Experiment runner ready; each result preserves individual-image rows.")
+
+----
+
+== 9. Run MNIST: 20 balanced handwritten digits, 4×4 versus 8×8
+
+This section keeps MNIST as the controlled handwritten benchmark but
+increases the sample to 20 balanced test examples. The comparison is
+useful for controlled shapes; it is not a substitute for photographs.
+Each size has its own state preparation and reconstruction metrics.
+
+[source,ipython3]
+----
+# Run all requested brightness increases on the larger MNIST sample at both image sizes.
+mnist_brightness = pd.concat([
+    evaluate_brightness(mnist4, 4, "MNIST", shot_examples=1),
+    evaluate_brightness(mnist8, 8, "MNIST", shot_examples=1),
+], ignore_index=True)
+mnist_negative = pd.concat([
+    evaluate_negative(mnist4, 4, "MNIST"),
+    evaluate_negative(mnist8, 8, "MNIST"),
+], ignore_index=True)
+display(dataset_summary(mnist_brightness))
+print("Negative summary")
+display(mnist_negative.groupby(["dataset", "side"])[["MAE", "PSNR_dB", "SSIM", "state_fidelity"]].mean().round(5))
+
+----
+
+== 10. Main use-case experiment: brighten LOL low-light photos toward normal-light references
+
+This is the project’s primary real-world evaluation. For every paired
+LOL test image, we take the low-light input and its normal-light
+reference. We apply +10%, +25%, and +50% brightness using
+classical multiplication, quantum controlled multiplication, and quantum
+global additive rotation.
+
+For each output, metrics are calculated against the paired normal-light
+reference. We also calculate classical-versus-quantum pixel agreement
+and state fidelity against the matching classical target. This
+distinguishes two questions: “Did the quantum circuit reproduce its
+classical operation?” and “Did that brightness operation improve
+similarity to the normal-light photo?”
+
+[source,ipython3]
+----
+# Compare the low-light input, enhanced output, and paired normal-light reference.
+def evaluate_lol_pairs(low_images, reference_images, side, filenames):
+    """Evaluate classical/quantum brightness outputs against paired normal-light ground truth."""
+    rows = []
+    for image_index, (low, reference) in enumerate(zip(low_images, reference_images)):
+        source_state = Statevector(frqi_circuit(low))
+        theta = image_to_angles(low)
+        rows.append({"dataset": "LOL low-light", "filename": filenames[image_index],
+                     "side": side, "increase": "input", "method": "unmodified low-light",
+                     "MAE_to_reference": image_metrics(reference, low)["MAE"],
+                     "PSNR_to_reference": image_metrics(reference, low)["PSNR_dB"],
+                     "SSIM_to_reference": image_metrics(reference, low)["SSIM"],
+                     "MAE_quantum_vs_classical": np.nan, "state_fidelity_to_classical": np.nan,
+                     "saturated_fraction": 0.0})
+        for increase in INCREASES:
+            cases = [
+                ("Classical multiplicative", None, classical_multiplicative(low, increase)),
+                ("Quantum controlled multiplicative", controlled_multiplicative_gate(low, increase), classical_multiplicative(low, increase)),
+                ("Classical additive", None, classical_additive(low, increase)),
+                ("Quantum global additive", global_brightness_gate(side, increase), classical_additive(low, increase)),
+            ]
+            for method, gate, classical_target in cases:
+                if gate is None:
+                    output = classical_target
+                    fidelity = np.nan
+                    quantum_error = np.nan
+                else:
+                    transformed_state = source_state.evolve(gate)
+                    output = decode_exact(transformed_state, side)
+                    fidelity = state_fidelity(transformed_state, ideal_frqi_state(classical_target))
+                    quantum_error = image_metrics(classical_target, output)["MAE"]
+                quality = image_metrics(reference, output)
+                rows.append({"dataset": "LOL low-light", "filename": filenames[image_index],
+                             "side": side, "increase": f"+{increase:.0%}", "method": method,
+                             "MAE_to_reference": quality["MAE"],
+                             "PSNR_to_reference": quality["PSNR_dB"],
+                             "SSIM_to_reference": quality["SSIM"],
+                             "MAE_quantum_vs_classical": quantum_error,
+                             "state_fidelity_to_classical": fidelity,
+                             "saturated_fraction": float(np.mean(low * (1+increase) > 255))})
+    return pd.DataFrame(rows)
+
+if lol_pairs:
+    lol_filenames = [pair[2] for pair in lol_pairs]
+    lol_results8 = evaluate_lol_pairs(lol_low8, lol_ref8, 8, lol_filenames)
+    lol_results16 = evaluate_lol_pairs(lol_low16, lol_ref16, 16, lol_filenames)
+    lol_results = pd.concat([lol_results8, lol_results16], ignore_index=True)
+    print("Mean LOL test-set quality against paired normal-light reference:")
+    display(lol_results.groupby(["side", "increase", "method"])[
+        ["MAE_to_reference", "PSNR_to_reference", "SSIM_to_reference", "MAE_quantum_vs_classical", "state_fidelity_to_classical", "saturated_fraction"]
+    ].mean(numeric_only=True).round(4))
+else:
+    lol_results = pd.DataFrame()
+    print("LOL results are waiting for the official paired test archive.")
+
+----
+
+== 11. Offline supplementary photo benchmark
+
+All **12 newly supplied images** form this dataset. They include caves, dim indoor/outdoor scenes, night paths, and two brighter scenes with light trails or sunlight glare. Every supplied file is retained unchanged and evaluated; none is silently omitted or replaced by an older photo. The source files, dimensions, checksums, and individual caveats are recorded in `data/dataset_manifest.json`.
+
+All images receive +10%, +25%, and +50% brightness increases and the existing negative comparison. No brightness decrease is introduced. The two brighter inputs are included as requested: increasing brightness can clip their highlights, so results must not be described as universally improving low-light visibility. Some sources already contain haze or shallow focus; this project does not remove it or add a blur filter. Original full-resolution photos are shown beside their reduced FRQI input grids.
+
+The original 8×8 and 16×16 benchmarks remain. There is no paired normal-light reference for these 12 files, so metrics measure operation agreement rather than restoration to correct exposure. MNIST remains the separate requested digit study; no old stock photo or prior sunset is used.
+
+[source,ipython3]
+----
+photo_folder = PROJECT_ROOT / "data/photos"
+dataset_manifest = json.loads((PROJECT_ROOT / "data/dataset_manifest.json").read_text())
+photo_paths = [PROJECT_ROOT / "data" / item["path"] for item in dataset_manifest["images"]]
+print(f"Supplied dataset: {len(photo_paths)} original photos; all are included.")
+display(pd.DataFrame(dataset_manifest["images"])[["id", "filename", "width", "height", "mean_grayscale", "note"]])
+if not photo_paths:
+    raise FileNotFoundError("Add user-selected photos to data/photos/ and the dataset manifest before running this benchmark.")
+photo_sources = {path.name: np.asarray(Image.open(path).convert("RGB")) for path in photo_paths}
+photo8 = {name: resize_dataset([image], 8)[0] for name, image in photo_sources.items()}
+photo16 = {name: resize_dataset([image], 16)[0] for name, image in photo_sources.items()}
+for name, original in photo_sources.items():
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].imshow(original, interpolation="nearest")
+    axes[0].set_title(name + " — original supplied photo")
+    axes[1].imshow(photo16[name], cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+    axes[1].set_title("16×16 grayscale FRQI input")
+    for axis in axes:
+        axis.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+photo_brightness = pd.concat([
+    evaluate_brightness(list(photo8.values()), 8, "Supplied real-scene photos", shot_examples=1),
+    evaluate_brightness(list(photo16.values()), 16, "Supplied real-scene photos", shot_examples=1),
+], ignore_index=True)
+photo_negative = pd.concat([
+    evaluate_negative(list(photo8.values()), 8, "Supplied real-scene photos"),
+    evaluate_negative(list(photo16.values()), 16, "Supplied real-scene photos"),
+], ignore_index=True)
+display(dataset_summary(photo_brightness))
+print("Photo negative summary")
+display(photo_negative.groupby(["dataset", "side"])[["MAE", "PSNR_dB", "SSIM", "state_fidelity"]].mean().round(5))
+
+----
+
+== 12. Visual comparison on the supplied real-scene dataset
+
+Every one of the 12 supplied photos appears below with its original grayscale grid and classical, quantum-controlled, and original global-additive outputs at +10%, +25%, and +50%. Fixed grayscale limits and nearest-neighbor rendering make the brightness and grid effects visible. These images are not claimed to be paired low/normal-light captures. Section 12A uses the same complete dataset for original-recovery comparisons.
+
+[source,ipython3]
+----
+gallery_examples = []
+if lol_pairs:
+    gallery_examples.extend((lol_low16[index], lol_ref16[index], f"LOL paired low-light: {name}") for index, name in enumerate(lol_filenames))
+gallery_examples.extend((photo16[name], None, f"Supplied photo: {name} (no paired normal-light reference)") for name in photo_sources)
+for gallery_index, (gallery_low, gallery_reference, gallery_title) in enumerate(gallery_examples, start=1):
+    gallery_side = gallery_low.shape[0]
+    gallery_state = Statevector(frqi_circuit(gallery_low))
+    gallery_panels = [("Original low-light input", gallery_low)]
+    if gallery_reference is not None:
+        gallery_panels.append(("Normal-light reference", gallery_reference))
+    for amount in INCREASES:
+        classical_out = classical_multiplicative(gallery_low, amount)
+        quantum_out = decode_exact(gallery_state.evolve(controlled_multiplicative_gate(gallery_low, amount)), gallery_side)
+        global_out = decode_exact(gallery_state.evolve(global_brightness_gate(gallery_side, amount)), gallery_side)
+        gallery_panels.extend([(f"Classical +{amount:.0%}", classical_out),
+                               (f"Quantum controlled +{amount:.0%}", quantum_out),
+                               (f"Quantum global additive +{amount:.0%}", global_out)])
+    columns = 4
+    rows = int(np.ceil(len(gallery_panels)/columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(11, 3*rows))
+    for axis, (title, image) in zip(axes.ravel(), gallery_panels):
+        axis.imshow(image, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+        axis.set_title(title, fontsize=8)
+        axis.axis("off")
+    for axis in axes.ravel()[len(gallery_panels):]:
+        axis.axis("off")
+    fig.suptitle(gallery_title)
+    plt.tight_layout()
+    gallery_directory = PROJECT_ROOT / "results/photo_galleries"
+    gallery_directory.mkdir(parents=True, exist_ok=True)
+    fig.savefig(gallery_directory / f"gallery_{gallery_index:02d}.png", dpi=130)
+    plt.show()
+
+----
+
+== 12A. Transform, reconstruct, recover the original, and compare quality
+
+This experiment separates two questions. **Forward reconstruction:** does the decoded quantum output match the intended classical transformation? Compare against the clipped classical brightness target (or the classical negative), not the original dark input. **Recovery back to the original:** undo the operation on the transformed output and compare with the original, same-size grayscale input.
+
+For +10%, +25%, +50% brightness, recovery divides the transformed pixel values by the corresponding gain. The quantum recovery circuit is built only from the decoded transformed image and the known gain, never from saved original pixel angles. Thus saturated highlights cannot be secretly recovered using the original encoding information. This division is an inverse-operation test, not a new user-facing darkening condition. For the negative, apply `255 − value` again classically, or another X gate in the reconstructed quantum branch.
+
+Compare classical floating-point processing, ideal exact FRQI reconstruction, and finite-shot FRQI readout with the same preprocessing and grayscale resolution. Classical rounding is not introduced before the metrics, and exact-state access is explicitly privileged simulator access. The finite-shot branch includes a readout after the forward transform, re-encoding of that measured image, and a second sampled readout after recovery. It uses two shot budgets; it is not equally cheap as exact readout.
+
+MAE lower is better; PSNR and SSIM higher are better. “Tie” means numerical agreement within 1e−4 gray levels, not superiority of one method. In this ideal controlled transformation, classical and exact quantum processing should agree. Recovery quality measures how much information survives the operation, not whether the low-light photograph has been restored to its correct real-world exposure. No paired normal-light references are available for the 12 supplied photos.
+
+[source,ipython3]
+----
+def comparison_quality(reference, estimate):
+    score = image_metrics(reference, estimate)
+    mse = float(np.mean((np.asarray(reference, float)-np.asarray(estimate, float))**2))
+    score["PSNR_dB"] = float("inf") if mse < 1e-12 else float(10*np.log10(255**2/mse))
+    return score
+
+def recover_transformed_image(transformed_image, condition, amount=0.0, use_shots=False, seed=2026):
+    side = transformed_image.shape[0]
+    state = Statevector(frqi_circuit(transformed_image))
+    if condition == "negative":
+        recovered_state = state.evolve(negative_gate(side))
+    else:
+        inverse_change = 1/(1+amount)-1
+        recovered_state = state.evolve(controlled_multiplicative_gate(transformed_image, inverse_change))
+    if use_shots:
+        return decode_by_shots(recovered_state, side, SHOTS_PER_PIXEL*side*side, seed=seed)
+    return decode_exact(recovered_state, side)
+
+recovery_directory = PROJECT_ROOT / "results/reconstruction_comparison"
+recovery_directory.mkdir(parents=True, exist_ok=True)
+recovery_rows = []
+recovery_decisions = []
+for name, source in photo_sources.items():
+    original = resize_dataset([source], 32)[0]
+    side = original.shape[0]
+    base_state = Statevector(frqi_circuit(original))
+    conditions = [("brightness", amount) for amount in INCREASES] + [("negative", 0.0)]
+    for condition_index, (condition, amount) in enumerate(conditions):
+        label = "Negative" if condition == "negative" else f"Brightness +{amount:.0%}"
+        if condition == "negative":
+            classical_forward = classical_negative(original)
+            transformed_state = base_state.evolve(negative_gate(side))
+            classical_recovered = classical_negative(classical_forward)
+        else:
+            classical_forward = classical_multiplicative(original, amount)
+            transformed_state = base_state.evolve(controlled_multiplicative_gate(original, amount))
+            classical_recovered = classical_forward/(1+amount)
+        quantum_forward = decode_exact(transformed_state, side)
+        sampled_forward = decode_by_shots(transformed_state, side, SHOTS_PER_PIXEL*side*side, seed=2026+condition_index)
+        quantum_recovered = recover_transformed_image(quantum_forward, condition, amount)
+        sampled_recovered = recover_transformed_image(sampled_forward, condition, amount, use_shots=True, seed=3026+condition_index)
+        for method, forward, recovered in [
+            ("Classical float", classical_forward, classical_recovered),
+            ("Quantum exact", quantum_forward, quantum_recovered),
+            ("Quantum sampled twice", sampled_forward, sampled_recovered),
+        ]:
+            forward_score = comparison_quality(classical_forward, forward)
+            recovered_score = comparison_quality(original, recovered)
+            recovery_rows.append(dict(image=name, condition=label, method=method, side=side,
+                forward_MAE=forward_score["MAE"], forward_PSNR_dB=forward_score["PSNR_dB"], forward_SSIM=forward_score["SSIM"],
+                recovery_MAE=recovered_score["MAE"], recovery_PSNR_dB=recovered_score["PSNR_dB"], recovery_SSIM=recovered_score["SSIM"],
+                total_shots=2*SHOTS_PER_PIXEL*side*side if method == "Quantum sampled twice" else 0,
+                clipped_fraction=float(np.mean(original*(1+amount)>255)) if condition != "negative" else 0.0))
+        agreement_error = float(np.max(np.abs(classical_recovered-quantum_recovered)))
+        decision = "Tie within numerical precision" if agreement_error < 1e-4 else "Different outputs; inspect metrics"
+        recovery_decisions.append(dict(image=name, condition=label, classical_vs_exact=decision,
+                                      max_recovered_pixel_difference=agreement_error))
+        panels = [("Original grayscale input", original), ("Classical transformed", classical_forward),
+                  ("Quantum reconstructed", quantum_forward), ("Classical recovered original", classical_recovered),
+                  ("Quantum exact recovered original", quantum_recovered), ("Quantum sampled recovered original", sampled_recovered)]
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        for axis, (title, pixels) in zip(axes.ravel(), panels):
+            axis.imshow(pixels, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+            axis.set_title(title, fontsize=10)
+            axis.axis("off")
+        fig.suptitle(f"{name} — {label} — {side}×{side}\n{decision}")
+        plt.tight_layout()
+        safe_name = Path(name).stem
+        suffix = "negative" if condition == "negative" else f"plus{round(amount*100)}"
+        fig.savefig(recovery_directory / f"{safe_name}_{suffix}_comparison.png", dpi=130)
+        np.savez_compressed(recovery_directory / f"{safe_name}_{suffix}_arrays.npz", original=original,
+            classical_forward=classical_forward, quantum_forward=quantum_forward, sampled_forward=sampled_forward,
+            classical_recovered=classical_recovered, quantum_recovered=quantum_recovered, sampled_recovered=sampled_recovered)
+        plt.show()
+recovery_results = pd.DataFrame(recovery_rows)
+recovery_summary = pd.DataFrame(recovery_decisions)
+recovery_results.to_csv(recovery_directory / "quality_metrics.csv", index=False)
+recovery_summary.to_csv(recovery_directory / "quality_decisions.csv", index=False)
+display(recovery_results.round(6))
+display(recovery_summary)
+assert recovery_summary["max_recovered_pixel_difference"].max() < 1e-4
+print("Classical and ideal exact quantum recovery agree. Sampled quantum outputs include measurement error.")
+print("Brightening recovery cannot restore clipped highlights. These metrics are not normal-exposure restoration scores.")
+
+----
+
+== 13. Image-size effect and circuit resources
+
+FRQI uses `2 log2(S)+1` qubits for an `S×S` grayscale image, while
+its state contains `S²` pixel amplitudes. The multiplexed preparation
+and per-pixel controlled brightness operations require address-dependent
+logic whose cost grows with pixel count. The one-gate global rotation
+and negative stay constant in gate count, but this alone does not give
+an end-to-end speed advantage: loading and reading all pixel values
+remain costly.
+
+[source,ipython3]
+----
+# Compare qubit counts and operation structure without compiling very large multiplexors.
+resource_rows = []
+for side in (4, 8, 16, 32):
+    resource_rows.append({
+        "grid": f"{side}x{side}", "pixels": side * side,
+        "position_qubits": position_qubits(side), "total_qubits": position_qubits(side) + 1,
+        "FRQI_controlled_rotations": side * side,
+        "controlled_brightness_rotations": side * side,
+        "global_Ry_gates": 1, "negative_X_gates": 1,
+    })
+resource_table = pd.DataFrame(resource_rows)
+display(resource_table)
+
+# Plot the size growth to show why simulator-only image reconstruction is kept small.
+plt.figure(figsize=(6, 3.5))
+plt.plot(resource_table["pixels"], resource_table["total_qubits"], "o-", label="qubits")
+plt.plot(resource_table["pixels"], resource_table["FRQI_controlled_rotations"], "s-", label="address-conditioned rotations")
+plt.xscale("log", base=2)
+plt.yscale("log", base=2)
+plt.xlabel("pixels in the image")
+plt.ylabel("count (log scale)")
+plt.title("FRQI image size and circuit requirements")
+plt.legend()
+plt.grid(alpha=.25)
+plt.show()
+
+----
+
+== 14. Finite-shot readout: more measurements, lower sampling error
+
+Exact simulation gives ideal probabilities; a quantum measurement
+returns samples. The following experiment measures one 16×16 photo
+negative with progressively larger shot budgets and repeats each budget
+several times. Error should generally decrease as the sample count
+rises, though individual points fluctuate. Each outcome picks an address
+as well as a colour bit, so total shots are shared across all pixels.
+
+[source,ipython3]
+----
+# Measure one transformed image repeatedly at increasing total shot budgets.
+shot_image = photo16[next(iter(photo16))]
+shot_side = shot_image.shape[0]
+shot_state = Statevector(frqi_circuit(shot_image)).evolve(negative_gate(shot_side))
+shot_target = classical_negative(shot_image)
+shot_counts = [4096, 16384, 65536, 262144, 1048576]
+shot_rows = []
+for count in shot_counts:
+    errors = [image_metrics(shot_target, decode_by_shots(shot_state, shot_side, count, seed=rep))["MAE"] for rep in range(5)]
+    shot_rows.append({"total_shots": count, "average_shots_per_pixel": count / (shot_side**2), "mean_MAE": np.mean(errors), "std_MAE": np.std(errors)})
+shot_table = pd.DataFrame(shot_rows)
+display(shot_table.round(3))
+plt.figure(figsize=(6, 3.5))
+plt.errorbar(shot_table["total_shots"], shot_table["mean_MAE"], yerr=shot_table["std_MAE"], marker="o", capsize=3)
+plt.xscale("log", base=2)
+plt.yscale("log")
+plt.xlabel("total measurement shots")
+plt.ylabel("MAE (8-bit gray levels)")
+plt.title("Finite-shot image reconstruction error")
+plt.grid(alpha=.25)
+plt.show()
+
+----
+
+== 15. Combined results and interpretation
+
+The LOL table answers the use-case question by scoring enhanced
+low-light images against their paired normal-light references. MNIST and
+bundled photographs remain supporting checks. Exact quantum/classical
+pixel agreement measures whether the circuit implements the intended
+operation; reference metrics measure whether that operation improves the
+low-light image.
+
+[source,ipython3]
+----
+# Summarize all available experiment outputs while keeping LOL as the main application result.
+print("Primary use-case: LOL paired low-light evaluation")
+if not lol_results.empty:
+    display(lol_results.groupby(["side", "increase", "method"])[
+        ["MAE_to_reference", "PSNR_to_reference", "SSIM_to_reference", "MAE_quantum_vs_classical", "state_fidelity_to_classical"]
+    ].mean(numeric_only=True).round(4))
+else:
+    print("No LOL pair metrics yet. Add the official Test.zip archive and rerun Sections 7 and 10.")
+
+print("Supporting benchmark: balanced MNIST")
+display(dataset_summary(mnist_brightness))
+print("Supporting benchmark: bundled photographs")
+display(dataset_summary(photo_brightness))
+
+----
+
+== Notes for this focused revision
+
+The 12 user-supplied scenes have no aligned normal-light references. Exact agreement with a classical brightness operation verifies the circuit, not restoration of correct exposure. A 50% increase may still leave the darkest regions dim. The global Ry is the original additive demonstration and can fold beyond π/2 instead of clipping; the pixel-controlled multiplicative method is the primary classical comparison.
+
+This is noiseless classical statevector simulation. Small 8×8 and 16×16 grayscale grids lose detail; the original source photo itself is retained without a blur filter. Exact amplitudes are privileged simulator access, and finite-shot outputs are ideal simulated sampling, not hardware measurements. No end-to-end quantum speedup or deblurring capability is claimed.
